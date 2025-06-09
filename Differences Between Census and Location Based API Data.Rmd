@@ -1,0 +1,333 @@
+---
+title: How do traditional census measures like '% of Likely Homosexual Zip Codes Differ
+  from Website scraped data?"
+author: "Alex Berger"
+date: "2025-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objective
+
+In 2020, the U.S. Census collected two data points about LGBT households: counts of unmarried same-sex partners and same-sex spouses. While imperfect, these numbers offer a window into where queer couples live. But what about single people? Or those living with roommates or family? Without direct questions on sexual orientation, much of the queer population remains invisible.
+
+I wanted to know: *Where do queer people live, and how does that compare to where LGBT spaces---like drag bars or clubs---exist?*
+
+This analysis uses two sources:
+
+-   Structured data from the U.S. Census (focused on couples)
+
+-   Unstructured data from Google Maps (focused on places)
+
+This isn\'t just an academic exercise. These insights can influence:
+
+-   Real Estate: trends show that neighborhoods with higher concentrations of same-sex couples often experience rising property values
+
+-   Public Health: researchers have emphasized the importance of geographically identifying LGBTQ populations to improve access to targeted services and reduce health disparities
+
+-   Marketing: increased segmentation can help companies optimize their marketing spend by advertising in neighborhoods where queer people live
+
+Several studies have used Census data to explore how queer populations influence property values and health outcomes. However, the Census only captures data on couples. This obviously leaves out single LGBTQ individuals, those living with roommates, or people in non-traditional household structures. This post asks whether data from a more flexible, crowd-sourced, and up-to-date alternative (Google Maps API) can offer a clearer picture of where queer communities actually live and gather, beyond just who they live with.
+
+## Data Processing / Methods (can skip if uninterested)
+
+Load in necessary packages
+
+```{r}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(maps)
+library(osmdata)
+library(sf)
+library(ggplot2)
+library(tidycensus)
+library(tidyverse)
+library(tigris)
+library(leaflet)
+library(ggmap)
+library(ggfx)
+```
+
+The American Community Survey (ACS) is a five-year survey that uses Public Use Microdata Area (PUMA). These regions tend to be larger than zip codes but one city may have several PUMAs. Similarly one PUMA could span multiple municipalities and zip codes. ACS from 2019-2023 collected data on Same-Sex couples at the PUMA level but not the zip code level. Unfortunately, the ACS only collects data on Unmarried same sex couples- not on Married Households with same sex couples. Luckily, the 'Coupled Households' data contains both unmarried and married.
+
+| Data Point | Description                                                         |
+|------------------|------------------------------------------------------|
+| IT9E001    | Total                                                               |
+| IT9E002    | Unmarried-partner households                                        |
+| IT9E003    | Unmarried-partner households: Male householder and male partner     |
+| IT9E004    | Unmarried-partner households: Male householder and female partner   |
+| IT9E005    | Unmarried-partner households: Female householder and female partner |
+| IT9E006    | Unmarried-partner households: Female householder and male partner   |
+| IT9E007    | All other households                                                |
+
+: Unmarried-Partner Households by Sex of Partner B11009
+
+| Data Point | Description                                                                                                   |
+|------------------|------------------------------------------------------|
+| VDG001     | Total                                                                                                         |
+| VDG002     | Married couple household                                                                                      |
+| VDG003     | Married couple household: Opposite-sex married couple household                                               |
+| VDG004     | Married couple household: Same-sex married couple household                                                   |
+| VDG005     | Married couple household: Same-sex married couple household: Male-male married couple households              |
+| VDG006     | Married couple household: Same-sex married couple household: Female-female married couple households          |
+| VDG007     | Unmarried-partner couple household                                                                            |
+| VDG008     | Unmarried-partner household: Opposite-sex unmarried partner household                                         |
+| VDG009     | Unmarried-partner household: Same-sex unmarried partner households                                            |
+| VDG010     | Unmarried-partner household: Same-sex unmarried partner households: Male-male unmarried partner households    |
+| VDG011     | Unmarried-partner household: Same-sex unmarried partner households: Female-female unmarried partner household |
+| VDG012     | All other households                                                                                          |
+
+Ideally- it's best to connect data directly to an API. In this case, I connected to the PUMA website and downloaded 'nhgis0002_ds259_2020_zcta'. It's not easily reproducible unless these exact clicks are made.
+
+The dataset uses ZCTA (ZIP Code Tabulation Area), which closely corresponds to standard 5-digit ZIP codes and includes geographic coordinates for mapping. To estimate the prevalence of queer households, I added the number of married same-sex couples (VDG004) and unmarried same-sex couples (VDG009), then divided that by the total number of married couples (VDG002) and unmarried couples (VDG007). This gives a rough estimate of how many couples in each area are same-sex.
+
+However, this method leaves out single LGBTQ individuals and people living in non-couple arrangements (like with family or roommates). There\'s no reason to assume that the proportion of queer people in couples is the same as the proportion among single people. In fact, those two groups likely differ based on lifestyle, housing preferences, and financial circumstances. For example, queer singles might gravitate toward areas with more apartments, nightlife, or affordable rent, while queer couples may prefer quieter, more residential neighborhoods. Since there\'s no Census data that directly captures sexual orientation among people who aren\'t part of a couple, this approach likely underestimates the true location of the queer population in any given ZIP code.
+
+```{r}
+nhgis2020 <- read_csv("~/Downloads/nhgis0002_csv-2/nhgis0002_ds259_2020_zcta.csv") %>% 
+    mutate(LGBT_PERCENT = ( VDG004 +VDG009 )/(VDG002 + VDG007)    ) %>% 
+   dplyr::select(BASENAME,INTPTLAT,INTPTLON,LGBT_PERCENT,VDG001) %>% 
+  rename(ZIPCODE = BASENAME, HOUSEHOLDS = VDG001)
+print(nhgis2020)
+
+```
+
+Analyzing the entire US is a feat. In fact, it may be a waste of time if there are only a handful of metros with significant prevalence of queer people to analyze variation among zip codes. For this initial draft, I focused on Boston, where I live. Conveniently, the zip codes follow '021xx'. I created my own file to name all the zip codes- the census data only contain the zip code number, not the description. The zip code with the highest prevalence is the South End (02118), where 12.46% of the couples, both married and unmarried, are of the same sex. Within the area, the least prevalent zip code is Braintree (02184) at 1.50%.
+
+```{r}
+
+n <- read.csv('Bostonzip.csv') %>% mutate(ZIPCODE=as.character(ZIPCODE)) %>% 
+  mutate(ZIPCODE = str_pad(as.character(ZIPCODE), width = 5, side = "left", pad = "0"))
+boston <- nhgis2020 %>% 
+  filter(str_starts(ZIPCODE, "021")) %>% 
+  left_join(n,by='ZIPCODE') %>% 
+  arrange(desc(LGBT_PERCENT)) %>% 
+  relocate(ZIPCODE,NEIGHBORHOOD,LGBT_PERCENT)
+print(boston)
+
+```
+
+Create a function to start getting results from the Google Places API
+
+```{r}
+##hiding my API key for the script to work
+google_api_key <- Sys.getenv("google_api_key")
+# Function to search using Google Places API
+search_google_places <- function(api_key, location, radius, keyword) {  
+  url <- "https://maps.googleapis.com/maps/api/place/nearbysearch/json"  
+  all_results <- data.frame()  # Use data frame instead of list which works better with dplyr
+  next_page_token <- NULL  
+  repeat {  
+    # Query parameters  
+    params <- list(  
+      location = location, # latitude,longitude  
+      radius = radius,     # in meters  
+      keyword = keyword,  
+      key = api_key,  ##private key unique only to the users of the script
+      pagetoken = next_page_token # Include the next page token for pagination  
+    )  
+    response <- GET(url, query = params)  #make the API request
+
+    # Parse response  
+    content <- content(response, "text")  
+    data <- fromJSON(content, flatten = TRUE)  
+    
+    # Append the results  
+    if (!is.null(data$results)) {  
+      # Convert list to data frame and bind rows  
+      results_df <- as.data.frame(data$results)  
+      all_results <- bind_rows(all_results, results_df)  
+    }  
+    
+    # Debugging: Print the length of results obtained in each request  
+    cat("Fetched", length(data$results), "results\n")  
+    
+    # Check for next page  
+    next_page_token <- data$next_page_token  
+    
+    # If there's no next page token, stop the loop  
+    if (is.null(next_page_token)) {  
+      break  
+    }  
+    
+    # Google Places API has a delay before the next page token becomes valid  
+    Sys.sleep(10)  # Wait for 2 seconds before making the next request  
+  }  
+  
+  # Return all results  
+  return(all_results)  
+}  
+```
+
+Google Places API will give results around a certain point- not the whole country in one go. For an initial blog post, I focused on Boston, where I live. The script was set up to define the cities with their latitude and longitude in a separate data frame. Eventually, this script can be revised to loop through several major cities
+
+```{r}
+city_coords <- data.frame(
+  city = c("Boston, MA"),
+  location = c("42.3109,-71.052599")
+)
+```
+
+Google Places API allows for one keyword at a time. So- it is necessary to split the results in separate dataframes.
+
+```{r}
+google_results_gay_bar <- search_google_places(
+  api_key = google_api_key,
+  location = city_coords$location[1], # Replace with actual lat,long
+  radius = 500000, ##you can set the radius as far as you want but it won't necessarily return every result within that radius. I am not sure at what point it stops only that in order to fill the whole country you would need to loop through several city_corrds#location[1]
+  keyword = "gay bar"
+) 
+google_results_drag_show <- search_google_places(
+  api_key = google_api_key,
+  location = city_coords$location[1], # Replace with actual lat,long
+  radius = 500000,
+  keyword = "drag show"
+) 
+google_results_lgbt_club <- search_google_places(
+  api_key = google_api_key,
+  location = city_coords$location[1], # Replace with actual lat,long
+  radius = 500000,
+  keyword = "LGBT club"
+) 
+print(google_results_gay_bar$name)
+```
+
+Searching by only one key term presents results that are unrelated to the search term. For example, Portuguese American Club is clearer not a 'gay bar' per the search term. Other bars in the this list are may be listed as 'LGBT-friendly' but are not actually gay bars. In order to filter to only relevant, we can combine results from all three search terms, using a full join to not duplicate results, and then coalesce columns together to find any result that is not null
+
+```{r}
+id1 <- google_results_drag_show$place_id
+id2 <- google_results_lgbt_club$place_id
+id3 <- google_results_gay_bar$place_id
+
+# Combine into one vector and count occurrences
+all_ids <- c(id1, id2, id3)
+id_counts <- table(all_ids)
+
+# Filter for those that appear 2 or more times
+shared_place_ids <- names(id_counts[id_counts >= 2])
+
+
+joined_df <- full_join(google_results_drag_show, google_results_lgbt_club, by = "place_id", suffix = c("_drag", "_lgbt")) %>%
+  full_join(google_results_gay_bar, by = "place_id") # this will auto-suffix overlapping cols
+
+# Filter for shared place_ids
+filtered_df <- joined_df %>% filter(place_id %in% shared_place_ids) %>% 
+  mutate( geometry.location.lng=  coalesce(geometry.location.lng,geometry.location.lng_drag,geometry.location.lng_lgbt),
+         geometry.location.lat=  coalesce(geometry.location.lat,geometry.location.lat_drag,geometry.location.lat_lgbt))
+print(filtered_df$name)
+
+```
+
+In order to plot both data from the Google Maps Places API as well as the Census data, we need to see different shading per zip code. It is not critical to have the exact zip code boundaries. As some zip codes have irregular shapes, it could take unnecessary processing speed to store the exact contours of zip codes. Plus, zip codes are not event synonymous with how locals agree on defining boundaries of a neighborhood (and they themselves do not necessarily agree with each other). To simplify, we can create voronoi polygons around each centroid. A voronoi polygon is a shape where the boundaries are an equidistant line between each centroid: in this case- the centroid of the zip code.
+
+```{r}
+boston_sf <- st_as_sf(boston, coords = c("INTPTLON", "INTPTLAT"), crs = 4326)
+boston_proj <- st_transform(boston_sf, 3857)
+vor <- st_voronoi(st_union(boston_proj))
+vor_polygons <- st_collection_extract(vor, "POLYGON")
+vor_sf <- st_sf(geometry = vor_polygons)
+vor_sf <- st_set_crs(vor_sf, 3857)
+vor_sf <- st_join(vor_sf, boston_proj)
+vor_sf <- st_transform(vor_sf, 4326)
+```
+
+Data from gay bars and clubs is not provided consistently at the zip code level- only the street address, latitude and longitude. Because institutions are a single point, plotting them would just highlight commercial districts and leave out residential ones- making the map overly sharp. Because we are using the presence of gay bars and clubs to generalize to areas where queer people may be living, we can just summarize the number of gay bars per 'zip code'. Again, 'zip code' is generalized by the voronoi polygon around the zip code's centroid.
+
+```{r}
+clubs_sf <- st_as_sf(filtered_df,
+                     coords = c("geometry.location.lng", "geometry.location.lat"),
+                     crs = st_crs(boston_sf))
+nearest_zip_idx <- st_nearest_feature(clubs_sf, boston_sf)
+clubs_with_zip <- clubs_sf %>% 
+  mutate(ZIPCODE = boston_sf$ZIPCODE[nearest_zip_idx]) %>% 
+  st_drop_geometry() %>%   ##removes the geometry column that is no longer needed and this omission enables future joins
+  group_by(ZIPCODE) %>% 
+  summarise(club_count = n()) 
+print(clubs_with_zip)
+```
+
+Below shows this zip codes in the Boston area based on reported data for LGBT Couples (unmarried and married)
+
+```{r}
+bbox <- c(
+  left = min(boston$INTPTLON) - 0.05,
+  bottom = min(boston$INTPTLAT) - 0.05,
+  right = max(boston$INTPTLON) + 0.05,
+  top = max(boston$INTPTLAT) + 0.05
+)
+osm_data <- opq(bbox = bbox) %>%
+  add_osm_feature(key = "highway") %>%
+  osmdata_sf()
+
+ggplot() +
+  # Voronoi fill with alpha
+  with_blur(
+    geom_sf(data = vor_sf, aes(fill = LGBT_PERCENT), color = NA, alpha = 0.9),
+    sigma = 10  
+  ) +
+  # Roads on top — make them pop
+  geom_sf(data = osm_data$osm_lines, color = "gray", size = 0.4, alpha = 0.2) +
+  scale_fill_viridis_c(option = "D", name = "LGBT %") +
+  coord_sf(xlim = c(-71.2, -70.95), ylim = c(42.23, 42.4), expand = FALSE) +
+  labs(
+    title = "Estimated LGBT Percent Households by ZIP ",
+    subtitle = "Based on 2020 Census for Unmarried Couple and Same Sex Spouses",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "aliceblue"),
+    panel.grid = element_blank()
+  )
+```
+
+Below shows the prevalence of LGBT institutions based on Google Places API
+
+```{r}
+## add in clubs per zip and default to zero if none
+vor_sf_with_club <- vor_sf %>% 
+  left_join(clubs_with_zip, by = 'ZIPCODE') %>% 
+  mutate(club_count = coalesce(club_count,0))  #for zip codes with no club- they don't exist in 'clubs_with_zip'
+
+ggplot() +
+  # Voronoi fill with alpha
+  with_blur(
+    geom_sf(data = vor_sf_with_club, aes(fill = club_count), color = NA, alpha = 0.9),
+    sigma = 5  
+  ) +
+  # Roads on top — make them pop
+  geom_sf(data = osm_data$osm_lines, color = "gray", size = 0.4, alpha = 0.2) +
+  
+  
+  scale_fill_viridis_c(option = "D", name = "Prevalance of LGBT institutions") +
+  coord_sf(xlim = c(-71.2, -70.95), ylim = c(42.23, 42.4), expand = FALSE) +
+  labs(
+    title = "Estimated LGBT Percent Using Google Maps API ",
+    subtitle = "Heatmap of 'LGBT Clubs','Gay Bar','Drag Show'",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "aliceblue"),
+    panel.grid = element_blank()
+  )
+
+```
+
+## Conclusions
+
+The comparison between Census-reported LGBT couple households and Google Maps search results for queer nightlife reveals some alignment but also some differences. Some neighborhoods tell a consistent story: the South End, for example, ranks high on both maps. This shows a strong presence of same-sex couples and a concentration of LGBT-oriented venues. This overlap suggests that, despite their different data collection methods, both sources are capturing a shared underlying pattern of queer visibility and community density.
+
+But not all neighborhoods align so neatly. Jamaica Plain, long known as a welcoming and progressive area, shows one of the highest proportions of same-sex couples based on Census data. Yet nightlife-oriented search results from Google Maps yield relatively few venues in JP, suggesting that the neighborhood may be more residential or family-focused in its queer population. Conversely, parts of Dorchester (specifically Upham\'s Corner and Savin Hill) don\'t show as many queer couples in the Census, but surface a surprising number of bars and clubs from \"gay bar,\" \"drag show,\" and \"LGBT club\" keyword searches. This could reflect younger, more nightlife-driven queer communities, or underrepresentation in Census data due to nontraditional living arrangements or privacy concerns.
+
+Together, these findings highlight the importance of using multiple lenses to understand queer geographies. Where Census data offers statistical structure, Google\'s data adds cultural texture. When they agree, we gain confidence. When they differ, we gain curiosity---and new questions about how visibility, identity, and place intersect.
+
+## Limitations
+
+Bars are over represented in LGBT institution. It is possible that the prevalence of LGBT institutions, notably bars, is more influenced by local liquor ordinances rather than population demographics.
+
+Unlike residential data, which is aggregated across entire ZIP codes, venue data is pinpointed to exact locations. This creates an 'all-or-nothing' effect---where a single bar could shade an entire area, even if most nearby residents don't interact with it. While someone might live within a mile of an LGBT bar, the presence of the venue doesn't necessarily reflect community engagement or representation in that zone. The club could even attract visitors from miles away for a 'night out'.
